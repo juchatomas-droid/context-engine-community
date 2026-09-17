@@ -1,16 +1,22 @@
-"""Combined server — OAuth + API key MCP SSE behind one port for Railway.
+"""Combined server — OAuth + API key MCP behind one port for Railway.
 
-Two access methods:
+Three access methods:
 1. /sse — OAuth 2.1 (for Cowork, supports DCR)
 2. /api/sse — API key Bearer token (for OpenClaw and other clients)
+3. /gpt/<token>/mcp — streamable HTTP, token in the URL path (for ChatGPT
+   custom connectors: they do not reliably accept plain SSE, and a connector
+   registered as "no authentication" sends no Authorization header at all,
+   so the secret has to travel in the path)
 
 Uses two FastMCP instances sharing the same DB — one with OAuth, one without.
-Tools are registered via shared register_tools() function.
+The no-auth instance is served over BOTH transports: SSE under /api (Bearer
+token checked by middleware) and streamable HTTP under /gpt/<token>.
 """
 
 import os
 import sys
 import asyncio
+import contextlib
 
 from starlette.applications import Starlette
 from starlette.routing import Route, Mount
@@ -66,6 +72,9 @@ def create_app():
     server_url = os.environ.get("CTX_SERVER_URL",
                                 "https://unique-healing-production-7a14.up.railway.app")
     api_key = os.environ.get("CTX_API_KEY", oauth_pass)
+    # Token that appears verbatim in the /gpt/<token>/mcp URL. Keep it URL-safe
+    # (hex or base64url) — it is a path segment, not a query value.
+    http_token = os.environ.get("CTX_HTTP_TOKEN", api_key)
 
     if not oauth_pass:
         print("ERROR: CTX_OAUTH_PASS required", file=sys.stderr)
@@ -129,6 +138,12 @@ def create_app():
         mcp_api._tool_manager._tools[name] = tool
     api_mcp_app = BearerTokenMiddleware(mcp_api.sse_app(), api_key)
 
+    # ── Same instance over streamable HTTP (ChatGPT connectors) ──
+    # Stateless: ChatGPT reconnects from many places and does not guarantee
+    # session affinity, same as the claude.ai connectors.
+    mcp_api.settings.stateless_http = True
+    gpt_mcp_app = mcp_api.streamable_http_app()
+
     # ── Utility endpoints ─────────────────────────────────────
     async def health(request):
         return PlainTextResponse("ok")
@@ -149,12 +164,22 @@ def create_app():
     all_routes = [
         Route("/health", health),
         Route("/admin/upload-db", upload_db, methods=["POST"]),
+        # Streamable HTTP, secret in path: /gpt/<token>/mcp
+        Mount("/gpt", routes=[Mount(f"/{http_token}", app=gpt_mcp_app)]),
         Mount("/api", app=api_mcp_app),   # API key: /api/sse, /api/messages/
     ] + oauth_routes + [
         Mount("/", app=oauth_mcp_app),    # OAuth: /sse, /messages/
     ]
 
-    return Starlette(routes=all_routes), host, port
+    # The streamable HTTP session manager has to run for the whole app
+    # lifetime. Starlette does NOT run lifespans of mounted sub-apps, so it
+    # must be attached to the top-level app or every /gpt request 500s.
+    @contextlib.asynccontextmanager
+    async def lifespan(app):
+        async with mcp_api.session_manager.run():
+            yield
+
+    return Starlette(routes=all_routes, lifespan=lifespan), host, port
 
 
 def main():
@@ -169,6 +194,9 @@ def main():
     init_db()
 
     print(f"Combined OAuth + API key MCP server on {host}:{port}")
+    print(f"  OAuth (SSE):        /sse")
+    print(f"  API key (SSE):      /api/sse")
+    print(f"  ChatGPT (HTTP):     /gpt/<CTX_HTTP_TOKEN>/mcp")
     asyncio.run(run())
 
 
