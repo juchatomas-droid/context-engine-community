@@ -8,8 +8,14 @@ version = "0.1.0"
 description = "Strukturovana kontextova pamat — MCP server pre Life OS"
 requires-python = ">=3.11"
 dependencies = [
-    "mcp>=1.0",
+    # Pinned below 2.0 on purpose. mcp 2.x renamed FastMCP to MCPServer, so
+    # `from mcp.server.fastmcp import FastMCP` (server.py, combined_server.py)
+    # raises ModuleNotFoundError on 2.x. mcp 2.x also dropped the
+    # pydantic-settings dependency that mcp-oauth imports but does not declare,
+    # so an unpinned rebuild breaks twice over.
+    "mcp>=1.0,<2",
     "pydantic>=2.0",
+    "pydantic-settings>=2.0",  # imported by mcp-oauth, not declared by it
     "mcp-oauth>=0.0.6",
     "sqlite-vec>=0.1.6",
     "voyageai>=0.3.2",
